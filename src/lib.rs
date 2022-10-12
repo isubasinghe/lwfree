@@ -1,3 +1,8 @@
+use std::{
+    slice::SliceIndex,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
 pub trait ContentionMeasure {
     fn new() -> Self;
     fn detected(&self) -> bool;
@@ -27,25 +32,29 @@ impl ContentionMeasure for CounterContentionMeasure {
 pub trait NormalisedLockFree {
     type Input;
     type Output;
-    type CasDescriptor;
+    type Descriptor: SliceIndex<usize>;
     type ContentionMeasure: ContentionMeasure;
-    fn prepare(&self, op: &Self::Input) -> Vec<Self::CasDescriptor>;
-    fn execute(&self, cases: &[Self::CasDescriptor], contention: &mut Self::ContentionMeasure) -> Result<(), usize>;
+    fn generator(&self, op: &Self::Input) -> Vec<Self::Descriptor>;
+    fn execute(
+        &self,
+        cases: &[Self::Descriptor],
+        contention: &mut Self::ContentionMeasure,
+    ) -> Result<(), usize>;
     fn cleanup(&self);
 }
-pub struct Help {}
-// wait-free queue
-struct HelpQueue {
-
+pub struct Help {
+    completed: AtomicBool,
+    at: AtomicUsize,
 }
+// wait-free queue
+struct HelpQueue {}
 
 impl HelpQueue {
-    pub fn add(&self, help: Help) {
-    }
-    pub fn peek(&self) -> Option<&Help> {
+    pub fn add(&self, help: *const Help) {}
+    pub fn peek(&self) -> Option<*const Help> {
         todo!()
     }
-    pub fn try_remove_front(&self, completed: &Help) {
+    pub fn try_remove_front(&self, completed: *const Help) {
         todo!()
     }
 }
@@ -56,27 +65,31 @@ pub struct WaitFreeSimulator<LF: NormalisedLockFree> {
 }
 
 impl<LF: NormalisedLockFree> WaitFreeSimulator<LF> {
+    fn help(&self) {
+        if let Some(help) = self.help_queue.peek() {}
+    }
     pub fn run(&self, op: LF::Input) -> LF::Output {
-        if /* once in a while */ false {
-            if let Some(help) = self.help_queue.peek() {
-                // do something to help
-                // help `help` make progress
-
-
-            }
+        if
+        /* once in a while */
+        false {
+            self.help();
         }
         let mut contention = LF::ContentionMeasure::new();
-        let cas = self.lf.prepare(&op);
+        let cas = self.lf.generator(&op);
         match self.lf.execute(&cas[..], &mut contention) {
             Ok(()) => {
                 self.lf.cleanup();
-            }, 
+            }
             Err(cnt) => {
-                // slow path 
-                let help = Help {};
-                self.help_queue.add(help);
-
-                
+                // slow path
+                let help = Help {
+                    completed: AtomicBool::new(false),
+                    at: AtomicUsize::new(cnt),
+                };
+                self.help_queue.add(&help);
+                while !help.completed.load(Ordering::SeqCst) {
+                    self.help();
+                }
             }
         }
         unimplemented!()
