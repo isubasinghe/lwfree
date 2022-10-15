@@ -1,4 +1,5 @@
 use std::{
+    ops::Index,
     slice::SliceIndex,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
@@ -29,18 +30,30 @@ impl ContentionMeasure for CounterContentionMeasure {
     }
 }
 
+pub trait CasDescriptor {
+    fn execute(&self) -> Result<(), ()>;
+}
+
+pub trait CasDescriptors<D>: Index<usize, Output = D>
+where
+    D: CasDescriptor,
+{
+    fn len(&self) -> usize;
+}
+
 pub trait NormalisedLockFree {
     type Input;
     type Output;
-    type Descriptor: SliceIndex<usize>;
+    type Cas: CasDescriptor;
+    type Cases: CasDescriptors<Self::Cas>;
     type ContentionMeasure: ContentionMeasure;
-    fn generator(&self, op: &Self::Input) -> Vec<Self::Descriptor>;
-    fn execute(
+    fn generator(&self, op: &Self::Input, contention: &mut Self::ContentionMeasure) -> Self::Cases;
+    fn wrap_up(
         &self,
-        cases: &[Self::Descriptor],
-        contention: &mut Self::ContentionMeasure,
-    ) -> Result<(), usize>;
-    fn cleanup(&self);
+        result: Result<(), usize>,
+        performed: &Self::Cases,
+        contention: &mut Self::ContentionMeasure
+    ) -> Result<Self::Output, ()>;
 }
 pub struct Help {
     completed: AtomicBool,
@@ -65,22 +78,45 @@ pub struct WaitFreeSimulator<LF: NormalisedLockFree> {
 }
 
 impl<LF: NormalisedLockFree> WaitFreeSimulator<LF> {
+    fn cas_execute<C: ContentionMeasure>(
+        &self,
+        descriptors: &LF::Cases,
+        contention: &mut C,
+    ) -> Result<(), usize> {
+        let len = descriptors.len();
+        for i in 0..len {
+            if descriptors[i].execute().is_err() {
+                contention.detect();
+                return Err(i);
+            }
+        }
+        Ok(())
+    }
     fn help(&self) {
         if let Some(help) = self.help_queue.peek() {}
     }
     pub fn run(&self, op: LF::Input) -> LF::Output {
-        if
-        /* once in a while */
-        false {
-            self.help();
-        }
-        let mut contention = LF::ContentionMeasure::new();
-        let cas = self.lf.generator(&op);
-        match self.lf.execute(&cas[..], &mut contention) {
-            Ok(()) => {
-                self.lf.cleanup();
+        let mut fast = true;
+        loop {
+            if fast {
+                let help = /* once in a while */ false;
+                if help {
+                    self.help()
+                }
+            } else {
+
             }
-            Err(cnt) => {
+
+            fast = false;
+            let mut contention = LF::ContentionMeasure::new();
+            let cas = self.lf.generator(&op, &mut contention);
+            let result = self.cas_execute(&cas, &mut contention);
+            match self.lf.wrap_up(result, &cas, &mut contention) {
+                Ok(outcome) => outcome,
+                Err(()) => continue,
+            };
+
+            if let Err(cnt) = result {
                 // slow path
                 let help = Help {
                     completed: AtomicBool::new(false),
@@ -92,25 +128,30 @@ impl<LF: NormalisedLockFree> WaitFreeSimulator<LF> {
                 }
             }
         }
-        unimplemented!()
     }
 }
-// in consuming crate
-/*
-struct LockFreeLinkedList<T> {
-    t: T,
-}
-impl<T> NormalisedLockFree for LockFreeLinkedList<T> {
-    fn pre_cas(&self) {}
-    fn help_cas(&self) {}
-    fn post_cas(&self) {}
-}
 
-struct WaitFreeLinkedList<T> {
-    simulator: WaitFreeSimulator<LockFreeLinkedList<T>>,
-}
-
-impl<T> WaitFreeLinkedList<T> {} */
+/**
+ * head -> A (@0x1)
+ * insert B (@0x2); B.next = 0x1
+ * CAS(head, 0x1, 0x2)
+ * succeed if A is still at the head 
+ * fail if A is no longer at the head
+ * imagine above has not yet executed
+ * meanwhile 
+ * insert C (@0x3) C.next = 0x1
+ * CAS(head, 0x1, 0x3)
+ * remove A
+ * CAS(C.next, 0x1, 0x0)
+ * insert D (@0x1); D.next = 0x3
+ * CAS(head, 0x3, 0x1)
+ * head -> D(@0x1) -> C(@0x3) -> .
+ * CAS(head, 0x1, 0x2) 
+ * head -> B(@0x2) -> A(0x1) actually D(@0x1) -> C(@0x3) -> .
+ * It works out here due to A and D having the same address, but if we imagine a doubly linked list it doesn't
+ * This CAS should have failed
+ * We need a counter associated with any given field
+ */
 
 #[cfg(test)]
 mod tests {
