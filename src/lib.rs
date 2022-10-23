@@ -1,7 +1,7 @@
 use std::{
     ops::Index,
     slice::SliceIndex,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
 };
 
 const CONTENTION_THRESHOLD: usize = 2;
@@ -58,29 +58,57 @@ pub trait NormalisedLockFree {
         contention: &mut Self::ContentionMeasure,
     ) -> Result<Self::Output, ()>;
 }
-pub struct OperationRecord {
-    completed: AtomicBool,
-    at: AtomicUsize,
-}
-// wait-free queue
-struct HelpQueue {}
 
-impl HelpQueue {
-    pub fn add(&self, help: *const OperationRecord) {}
-    pub fn peek(&self) -> Option<*const OperationRecord> {
+pub struct OperationRecordBox<LF: NormalisedLockFree> {
+    val: AtomicPtr<OperationRecord<LF>>,
+}
+enum OperationState<T> {
+    PreCAS,
+    ExecuteCas(LF::Cases),
+    PostCAS(LF::Cases),
+    Completed(T),
+}
+
+impl<T> OperationState<T> {
+    pub fn is_completed(&self) -> bool {
+        matches!(self, Self::Completed(..))
+    }
+}
+pub struct OperationRecord<LF: NormalisedLockFree> {
+    owner_tid: std::thread::ThreadId,
+    input: LF::Input,
+    state: OperationState<LF::Output>,
+    cas_list: LF::Cases,
+}
+
+// wait-free queue
+struct HelpQueue<LF: NormalisedLockFree> {
+    lf: LF,
+}
+
+impl<LF> HelpQueue<LF>
+where
+    LF: NormalisedLockFree,
+{
+    // TODO: append based on appendix a
+    pub fn enqueue(&self, help: *const OperationRecordBox<LF>) {}
+    pub fn peek(&self) -> Option<*const OperationRecordBox<LF>> {
         todo!()
     }
-    pub fn try_remove_front(&self, completed: *const OperationRecord) {
+    pub fn try_remove_front(&self, completed: *const OperationRecordBox<LF>) -> Result<(), ()> {
         todo!()
     }
 }
 
 pub struct WaitFreeSimulator<LF: NormalisedLockFree> {
     lf: LF,
-    help_queue: HelpQueue,
+    help_queue: HelpQueue<LF>,
 }
 
-impl<LF: NormalisedLockFree> WaitFreeSimulator<LF> {
+impl<LF: NormalisedLockFree> WaitFreeSimulator<LF>
+where
+    OperationRecord<LF>: Clone,
+{
     fn cas_execute<C: ContentionMeasure>(
         &self,
         descriptors: &LF::Cases,
@@ -95,15 +123,49 @@ impl<LF: NormalisedLockFree> WaitFreeSimulator<LF> {
         }
         Ok(())
     }
-    fn help(&self) {
+
+    // guarantees that on return orb is no longer in help queue
+    fn help_op(&self, orb: &OperationRecordBox<LF>) {
+        let or = unsafe { &*orb.val.load(Ordering::SeqCst) };
+        match or.state {
+            OperationState::PreCAS => {
+                let mut updated_or = Box::new(or.clone());
+
+                updated_or.cas_list = self
+                    .lf
+                    .generator(&updated_or.input, &mut LF::ContentionMeasure::new());
+                let updated_or = Box::into_raw(updated_or);
+                if orb
+                    .val
+                    .compare_exchange(
+                        or as *const OperationRecord<_> as *mut OperationRecord<_>,
+                        updated_or,
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    )
+                    .is_err()
+                {
+                    // Never got shared so safe to drop
+                    let _ = unsafe { Box::from_raw(updated_or) };
+                }
+            }
+            OperationState::ExecuteCas => {}
+            OperationState::PostCAS => {}
+            OperationState::Completed(..) => {
+                // if this fails, the orb must have been removed already
+                let _ = self.help_queue.try_remove_front(orb);
+            }
+        }
+    }
+    fn help_first(&self) {
         if let Some(help) = self.help_queue.peek() {}
     }
     pub fn run(&self, op: LF::Input) -> LF::Output {
         // fast path
         for retry in 0.. {
-            let help = /* once in a while */ false;
+            let help = /* once in a while */true;
             if help {
-                self.help();
+                self.help_first();
             }
             let mut contention = LF::ContentionMeasure::new();
             if contention.detected() {
@@ -127,29 +189,27 @@ impl<LF: NormalisedLockFree> WaitFreeSimulator<LF> {
                 // slow  path
                 break;
             }
-
-            /* if let Err(cnt) = result {
-                // slow path
-                let help = Help {
-                    completed: AtomicBool::new(false),
-                    at: AtomicUsize::new(cnt),
-                };
-                self.help_queue.add(&help);
-                while !help.completed.load(Ordering::SeqCst) {
-                    self.help();
-                }
-            } */
         }
 
-        let help = OperationRecord {
-            completed: AtomicBool::new(false),
-            at: AtomicUsize::new(0),
+        let or = OperationRecordBox {
+            val: AtomicPtr::new(Box::into_raw(Box::new(OperationRecord {
+                owner_tid: std::thread::current().id(),
+                input: op,
+                state: OperationState::PreCAS,
+                cas_list: (),
+            }))),
         };
-        self.help_queue.add(&help);
-        while !help.completed.load(Ordering::SeqCst) {
-            self.help();
+        self.help_queue.enqueue(&or);
+        loop {
+            // Safety: ??
+            // Need Hazard Pointers here
+            let or = unsafe { &*or.val.load(Ordering::SeqCst) };
+            if let OperationState::Completed(t) = or.state {
+                break t;
+            } else {
+                self.help_first();
+            }
         }
-        unreachable!()
     }
 }
 
