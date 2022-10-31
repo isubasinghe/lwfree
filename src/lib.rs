@@ -45,10 +45,10 @@ where
 }
 
 pub trait NormalisedLockFree {
-    type Input;
-    type Output;
+    type Input: Clone;
+    type Output: Clone;
     type Cas: CasDescriptor;
-    type Cases: CasDescriptors<Self::Cas>;
+    type Cases: CasDescriptors<Self::Cas> + Clone;
     type ContentionMeasure: ContentionMeasure;
     fn generator(&self, op: &Self::Input, contention: &mut Self::ContentionMeasure) -> Self::Cases;
     fn wrap_up(
@@ -62,23 +62,17 @@ pub trait NormalisedLockFree {
 pub struct OperationRecordBox<LF: NormalisedLockFree> {
     val: AtomicPtr<OperationRecord<LF>>,
 }
-enum OperationState<T> {
+enum OperationState<LF: NormalisedLockFree> {
     PreCAS,
     ExecuteCas(LF::Cases),
-    PostCAS(LF::Cases),
-    Completed(T),
+    PostCAS(LF::Cases, Result<(), usize>),
+    Completed(LF::Output),
 }
 
-impl<T> OperationState<T> {
-    pub fn is_completed(&self) -> bool {
-        matches!(self, Self::Completed(..))
-    }
-}
 pub struct OperationRecord<LF: NormalisedLockFree> {
     owner_tid: std::thread::ThreadId,
     input: LF::Input,
-    state: OperationState<LF::Output>,
-    cas_list: LF::Cases,
+    state: OperationState<LF>,
 }
 
 // wait-free queue
@@ -126,39 +120,73 @@ where
 
     // guarantees that on return orb is no longer in help queue
     fn help_op(&self, orb: &OperationRecordBox<LF>) {
-        let or = unsafe { &*orb.val.load(Ordering::SeqCst) };
-        match or.state {
-            OperationState::PreCAS => {
-                let mut updated_or = Box::new(or.clone());
-
-                updated_or.cas_list = self
-                    .lf
-                    .generator(&updated_or.input, &mut LF::ContentionMeasure::new());
-                let updated_or = Box::into_raw(updated_or);
-                if orb
-                    .val
-                    .compare_exchange(
-                        or as *const OperationRecord<_> as *mut OperationRecord<_>,
-                        updated_or,
-                        Ordering::SeqCst,
-                        Ordering::Relaxed,
-                    )
-                    .is_err()
-                {
-                    // Never got shared so safe to drop
-                    let _ = unsafe { Box::from_raw(updated_or) };
+        loop {
+            let or = unsafe { &*orb.val.load(Ordering::SeqCst) };
+            let updated_or = match &or.state {
+                OperationState::PreCAS => {
+                    let cas_list = self
+                        .lf
+                        .generator(&or.input, &mut LF::ContentionMeasure::new());
+                    Box::new(OperationRecord {
+                        owner_tid: or.owner_tid.clone(),
+                        state: OperationState::ExecuteCas(cas_list),
+                        input: or.input.clone(),
+                    })
                 }
-            }
-            OperationState::ExecuteCas => {}
-            OperationState::PostCAS => {}
-            OperationState::Completed(..) => {
-                // if this fails, the orb must have been removed already
-                let _ = self.help_queue.try_remove_front(orb);
+                OperationState::ExecuteCas(cas_list) => {
+                    let result = self.cas_execute(cas_list, &mut LF::ContentionMeasure::new());
+                    Box::new(OperationRecord {
+                        owner_tid: or.owner_tid.clone(),
+                        state: OperationState::PostCAS(cas_list.clone(), result),
+                        input: or.input.clone(),
+                    })
+                }
+                OperationState::PostCAS(cas_list, res) => {
+                    if let Ok(result) =
+                        self.lf
+                            .wrap_up(res.clone(), cas_list, &mut LF::ContentionMeasure::new())
+                    {
+                        Box::new(OperationRecord {
+                            owner_tid: or.owner_tid.clone(),
+                            state: OperationState::Completed(result),
+                            input: or.input.clone(),
+                        })
+                    } else {
+                        // restart from the generator
+                        Box::new(OperationRecord {
+                            owner_tid: or.owner_tid.clone(),
+                            state: OperationState::PreCAS,
+                            input: or.input.clone(),
+                        })
+                    }
+                }
+                OperationState::Completed(..) => {
+                    // if this fails, the orb must have been removed already
+                    let _ = self.help_queue.try_remove_front(orb);
+                    return;
+                }
+            };
+
+            let updated_or = Box::into_raw(updated_or);
+            if orb
+                .val
+                .compare_exchange(
+                    or as *const OperationRecord<_> as *mut OperationRecord<_>,
+                    updated_or,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                // Never got shared so safe to drop
+                let _ = unsafe { Box::from_raw(updated_or) };
             }
         }
     }
     fn help_first(&self) {
-        if let Some(help) = self.help_queue.peek() {}
+        if let Some(help) = self.help_queue.peek() {
+            self.help_op(unsafe {&*help});
+        }
     }
     pub fn run(&self, op: LF::Input) -> LF::Output {
         // fast path
@@ -196,7 +224,6 @@ where
                 owner_tid: std::thread::current().id(),
                 input: op,
                 state: OperationState::PreCAS,
-                cas_list: (),
             }))),
         };
         self.help_queue.enqueue(&or);
@@ -204,8 +231,8 @@ where
             // Safety: ??
             // Need Hazard Pointers here
             let or = unsafe { &*or.val.load(Ordering::SeqCst) };
-            if let OperationState::Completed(t) = or.state {
-                break t;
+            if let OperationState::Completed(t) = &or.state {
+                break t.clone();
             } else {
                 self.help_first();
             }
