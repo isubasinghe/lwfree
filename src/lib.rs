@@ -1,7 +1,6 @@
 use std::{
     ops::Index,
-    slice::SliceIndex,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, Ordering},
 };
 
 const CONTENTION_THRESHOLD: usize = 2;
@@ -77,7 +76,7 @@ pub struct OperationRecord<LF: NormalisedLockFree> {
 
 // wait-free queue
 struct HelpQueue<LF: NormalisedLockFree> {
-    lf: LF,
+    _lf: LF,
 }
 
 impl<LF> HelpQueue<LF>
@@ -85,11 +84,14 @@ where
     LF: NormalisedLockFree,
 {
     // TODO: append based on appendix a
-    pub fn enqueue(&self, help: *const OperationRecordBox<LF>) {}
+    pub fn enqueue(&self, help: *const OperationRecordBox<LF>) {
+        let _ = help;
+    }
     pub fn peek(&self) -> Option<*const OperationRecordBox<LF>> {
         todo!()
     }
     pub fn try_remove_front(&self, completed: *const OperationRecordBox<LF>) -> Result<(), ()> {
+        let _ = completed;
         todo!()
     }
 }
@@ -185,7 +187,7 @@ where
     }
     fn help_first(&self) {
         if let Some(help) = self.help_queue.peek() {
-            self.help_op(unsafe {&*help});
+            self.help_op(unsafe { &*help });
         }
     }
     pub fn run(&self, op: LF::Input) -> LF::Output {
@@ -265,5 +267,5 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // use super::*;
 }
